@@ -1,5 +1,5 @@
 import io
-import magic
+import os
 from typing import Tuple, Optional, Tuple
 
 import pdfplumber
@@ -22,11 +22,56 @@ from backend.core.config import (
     SUPPORTED_MIME_TYPES
 )
 
-class FileParsingError(Exception):
-    pass
-
 class FileValidationError(Exception):
     pass
+
+# Extension → MIME fallback table (used when both filetype and magic fail)
+_EXT_TO_MIME = {
+    '.pdf':  'application/pdf',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.doc':  'application/msword',
+}
+
+def _detect_mime_type(file_data: bytes, filename: str) -> str:
+    """Detect MIME type using multiple strategies for cross-platform compatibility.
+
+    Strategy 1 – filetype (pure Python, no native deps, works everywhere):
+        Fast, reliable for PDF magic-byte detection.
+    Strategy 2 – python-magic (requires libmagic DLL, optional on Windows):
+        More comprehensive, used if available.
+    Strategy 3 – file extension fallback:
+        Last resort when byte-sniffing fails (DOCX is a ZIP internally,
+        so filetype may return application/zip for valid .docx files).
+    """
+    ext = os.path.splitext(filename.lower())[1]
+
+    # Strategy 1: filetype (pure Python)
+    try:
+        import filetype as ft
+        kind = ft.guess(file_data)
+        if kind is not None:
+            mime = kind.mime
+            # DOCX files are ZIP archives — filetype correctly identifies the
+            # ZIP magic bytes but cannot tell it's a DOCX without the filename.
+            # Promote application/zip → DOCX MIME when the extension confirms it.
+            if mime == 'application/zip' and ext == '.docx':
+                return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            return mime
+    except Exception:
+        pass
+
+    # Strategy 2: python-magic (needs libmagic, optional on Windows)
+    try:
+        import magic
+        return magic.from_buffer(file_data, mime=True)
+    except Exception:
+        pass
+
+    # Strategy 3: extension-based fallback
+    if ext in _EXT_TO_MIME:
+        return _EXT_TO_MIME[ext]
+
+    return 'application/octet-stream'
 
 def validate_file(file_data:bytes, filename:str)->Tuple[bool, str, Optional[str]]:
     file_size_bytes = len(file_data)
@@ -41,9 +86,9 @@ def validate_file(file_data:bytes, filename:str)->Tuple[bool, str, Optional[str]
         return False, 'uploade file is empty...please check the file you have uploaded and try again'
     
     try:
-        mime_type=magic.from_buffer(file_data, mime=True)
+        mime_type = _detect_mime_type(file_data, filename)
     except Exception as e:
-        return False, f"error deteminin the file type : {e}", None
+        return False, f"error determining the file type: {e}", None
     
     if mime_type not in SUPPORTED_MIME_TYPES:
         supported=', '.join(SUPPORTED_MIME_TYPES.keys()).upper()
@@ -127,18 +172,17 @@ def _extract_pdf_with_pypdf2(file_data: bytes) -> str:
 
 
 def extract_text_from_pdf(file_data: bytes) -> str:
-    try: 
-        result, used_fallback=with_fallback(
-        _extract_pdf_with_pdfplumber, 
-        _extract_pdf_with_pypdf2, 
-        file_data, 
-        log_fallback=True
-    )
-    
+    try:
+        result, used_fallback = with_fallback(
+            _extract_pdf_with_pdfplumber,
+            _extract_pdf_with_pypdf2,
+            file_data,
+            log_fallback=True,
+        )
         if used_fallback:
-            log_info('PDF EXTRACTION succeded using the PyPDF2 fallback', context='resume_parser')
+            log_info('PDF EXTRACTION succeeded using the PyPDF2 fallback', context='resume_parser')
         return result
-        
+
     except Exception as e:
         log_error(e, context='extract_text_from_pdf')
         raise FileParsingError(
@@ -211,8 +255,6 @@ def extract_text(file_data:bytes, file_type:str)->str:
     else:
         raise FileValidationError(
             f'invalid file type: {file_type}. supported types are: pdf, docx and doc'
-
-
         )
     
 def parse_resume_file(file_data: bytes, filename:str)->Tuple[str, dict]:

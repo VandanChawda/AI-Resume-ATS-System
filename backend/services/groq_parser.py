@@ -8,7 +8,43 @@ from groq import Groq
 logger=logging.getLogger('ats_resume_scorer')
 
 
-GROQ_MODEL='llama-3.3-70b-versatile'
+# Priority list — first model found on the account is used
+_PREFERRED_MODELS = [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-70b-versatile',
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.6-27b',
+    'llama-3.1-8b-instant',
+    'groq/compound',
+    'groq/compound-mini',
+]
+
+_resolved_model: str | None = None
+
+def _resolve_model(client: 'Groq') -> str:
+    """Pick the first model from _PREFERRED_MODELS that is available on this account."""
+    global _resolved_model
+    if _resolved_model:
+        return _resolved_model
+    try:
+        available = {m.id for m in client.models.list().data}
+        for model in _PREFERRED_MODELS:
+            if model in available:
+                logger.info(f"Groq model selected: {model}")
+                _resolved_model = model
+                return model
+        # Last-resort: use whatever the first model is
+        first = next(iter(available), None)
+        if first:
+            logger.warning(f"No preferred model found — falling back to: {first}")
+            _resolved_model = first
+            return first
+    except Exception as e:
+        logger.warning(f"Could not list Groq models: {e}")
+    # Hard fallback if listing fails
+    _resolved_model = _PREFERRED_MODELS[0]
+    return _resolved_model
 
 _client=None
 
@@ -75,10 +111,10 @@ Important instructions:
 Resume Text:
 {raw_text}"""
 
-def _call_groq(client:Groq, system_prompt:str, user_prompt:str)->str:
-
-    response=client.chat.completions.create(
-        model=GROQ_MODEL, 
+def _call_groq(client: Groq, system_prompt: str, user_prompt: str) -> str:
+    model = _resolve_model(client)
+    response = client.chat.completions.create(
+        model=model,
         messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt}
@@ -86,7 +122,6 @@ def _call_groq(client:Groq, system_prompt:str, user_prompt:str)->str:
         temperature=0.0,
         max_tokens=4096
     )
-
     return response.choices[0].message.content.strip()
 
 def _try_parse_json(text: str) -> dict | None:
@@ -115,9 +150,8 @@ def parse_resume(raw_text: str)->Dict:
     raw_response=_call_groq(client, RESUME_SYSTEM_PROMPT, prompt)
     result=_try_parse_json(raw_response)
 
-    if result is None:
+    if result is not None:
         return _validate_resume_result(result)
-    
 
     logger.warning("Groq resume parse: first attempt returned invalid JSON, retrying...")
     strict_prompt = (
